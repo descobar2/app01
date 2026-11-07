@@ -12,7 +12,7 @@ import hmac
 import os
 import secrets
 import unicodedata
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -21,7 +21,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, UniqueConstraint, create_engine, func, select
+from sqlalchemy import Boolean, Date, DateTime, ForeignKey, Integer, String, UniqueConstraint, create_engine, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
 
@@ -117,6 +117,29 @@ class Shift(Base):
     weekday: Mapped[int] = mapped_column(Integer)
     start_minute: Mapped[int] = mapped_column(Integer)
     end_minute: Mapped[int] = mapped_column(Integer)
+
+
+class DatedShift(Base):
+    """A dated shift imported from a monthly roster. Never repeats weekly."""
+    __tablename__ = "dated_shifts"
+    __table_args__ = (UniqueConstraint("user_id", "work_date", "start_minute", "end_minute", "kind"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    work_date: Mapped[date] = mapped_column(Date, index=True)
+    start_minute: Mapped[int] = mapped_column(Integer)
+    end_minute: Mapped[int] = mapped_column(Integer)
+    kind: Mapped[str] = mapped_column(String(25))
+    source: Mapped[str] = mapped_column(String(150))
+    source_line: Mapped[int] = mapped_column(Integer)
+
+class ScheduleImportCoverage(Base):
+    """Day ranges for which dated rosters override recurring shifts, including days off."""
+    __tablename__ = "schedule_import_coverage"
+    __table_args__ = (UniqueConstraint("source", "start_day", "end_day"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    source: Mapped[str] = mapped_column(String(150))
+    start_day: Mapped[date] = mapped_column(Date, index=True)
+    end_day: Mapped[date] = mapped_column(Date, index=True)
 
 class Absence(Base):
     __tablename__ = "absences"
@@ -513,6 +536,42 @@ def add_shift(payload:ShiftInput,user:User=Depends(require_user),db:Session=Depe
     audit(db,user,"create","shift",str(s.id));db.commit()
     return {"id":s.id}
 
+
+@app.get("/api/schedule-months")
+def schedule_months(user: User = Depends(require_user), db: Session = Depends(db)):
+    permit(user, "supervisor", "coordinador", "tecnico")
+    periods = db.scalars(select(ScheduleImportCoverage).order_by(ScheduleImportCoverage.start_day.desc())).all()
+    months = set()
+    for period in periods:
+        cursor = period.start_day.replace(day=1)
+        while cursor <= period.end_day:
+            months.add(cursor.isoformat()[:7])
+            cursor = (cursor.replace(day=28) + timedelta(days=4)).replace(day=1)
+    return {"months": sorted(months, reverse=True)}
+
+@app.get("/api/dated-shifts")
+def dated_shifts(month: str, user: User = Depends(require_user), db: Session = Depends(db)):
+    permit(user, "supervisor", "coordinador", "tecnico")
+    try:
+        month_start = date.fromisoformat(month + "-01")
+        if month_start.isoformat()[:7] != month:
+            raise ValueError("Mes inválido")
+        month_end = (month_start.replace(day=28) + timedelta(days=4)).replace(day=1)
+    except (ValueError, TypeError):
+        raise HTTPException(422, "Mes inválido: use AAAA-MM")
+    query = (select(DatedShift, User.username, User.active)
+             .join(User, DatedShift.user_id == User.id)
+             .where(DatedShift.work_date >= month_start, DatedShift.work_date < month_end)
+             .order_by(DatedShift.work_date, DatedShift.start_minute, User.username))
+    if user.role == "tecnico":
+        query = query.where(DatedShift.user_id == user.id)
+    rows = db.execute(query.limit(2500)).all()
+    return [{"id": shift.id, "user_id": shift.user_id,
+             "username": username, "active": active,
+             "date": shift.work_date.isoformat(), "kind": shift.kind,
+             "start_minute": shift.start_minute, "end_minute": shift.end_minute}
+            for shift, username, active in rows]
+
 @app.post("/api/absences")
 def add_absence(payload:AbsenceInput,user:User=Depends(require_user),db:Session=Depends(db)):
     permit(user,"supervisor")
@@ -534,10 +593,21 @@ def candidates(db:Session, ticket:Ticket, start:datetime, end:datetime, exclude_
     if end_min<=start_min:return []
     levels=[ticket.level] if ticket.level in {"L1","L2","L3"} else []
     users=db.scalars(select(User).where(User.role=="tecnico",User.active.is_(True),User.level.in_(levels))).all()
+    roster_covered=bool(db.scalar(select(ScheduleImportCoverage.id).where(
+        ScheduleImportCoverage.start_day<=local_start.date(),
+        ScheduleImportCoverage.end_day>=local_start.date()).limit(1)))
     selected=[]
     for u in users:
-        possible=db.scalar(select(Shift.id).where(Shift.user_id==u.id,Shift.weekday==local_start.weekday(),
-                  Shift.start_minute<=start_min,Shift.end_minute>=end_min).limit(1))
+        # A dated roster is authoritative for its covered period: never extrapolate
+        # a weekly default into a day off. Guard duty is not a bookable appointment.
+        if roster_covered:
+            possible=db.scalar(select(DatedShift.id).where(
+                DatedShift.user_id==u.id, DatedShift.work_date==local_start.date(),
+                DatedShift.kind!="GUARDIA_L3",
+                DatedShift.start_minute<=start_min,DatedShift.end_minute>=end_min).limit(1))
+        else:
+            possible=db.scalar(select(Shift.id).where(Shift.user_id==u.id,Shift.weekday==local_start.weekday(),
+                      Shift.start_minute<=start_min,Shift.end_minute>=end_min).limit(1))
         if not possible:continue
         if db.scalar(select(Absence.id).where(Absence.user_id==u.id,Absence.start_at<end,Absence.end_at>start).limit(1)):continue
         if db.scalar(select(SupportSession.id).where(SupportSession.technician_id==u.id,
