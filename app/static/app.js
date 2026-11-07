@@ -157,6 +157,85 @@ async function sessions(){
 async function health(){const d=await api('/health');$('view').innerHTML=`<div class="grid"><article class="metric"><span>API</span><strong>${esc(d.service)}</strong></article><article class="metric"><span>Base de datos</span><strong>${esc(d.database)}</strong></article><article class="metric"><span>Eventos importados</span><strong>${esc(d.events)}</strong></article><article class="metric"><span>Microsoft Graph</span><strong style="font-size:17px">${d.graph_configured?'Configurado':'Pendiente'}</strong></article></div><div class="panel" style="margin-top:20px"><h2>Importación local</h2><p>Ejecutar en el servidor los comandos documentados de importación. No adjuntar datos reales al repositorio público.</p></div>`}
 async function companies(){let data=await api('/companies');$('view').innerHTML=`<div class="panel"><h2>Agregar empresa</h2><form id="company-form" class="box-form"><label>Código<input name="code" required></label><label>Nombre<input name="name" required></label><button class="primary">Guardar</button></form></div><div class="panel" style="margin-top:20px"><h2>Empresas registradas (${data.length})</h2>${table(['Código','Empresa','Estado'],data.map(c=>[esc(c.code),esc(c.name),tag(c.active?'Activa':'Inactiva')+` <button data-toggle-company=\"${c.id}\" data-active=\"${c.active}\">${c.active?'Desactivar':'Activar'}</button>`]))}</div>`;$('company-form').onsubmit=async(e)=>{e.preventDefault();try{await api('/companies',{method:'POST',body:JSON.stringify(Object.fromEntries(new FormData(e.target)))});await goto('companies');flash('Empresa registrada')}catch(e){flash(e.message,true)}}}
 async function users(){const data=await api('/users');const companies=await api('/companies');$('view').innerHTML=`<div class="panel"><h2>Crear cuenta</h2><form id="user-form" class="box-form"><label>Usuario<input name="username" required></label><label>Contraseña inicial<input name="password" type="password" minlength="12" required></label><label>Rol<select name="role">${['externo','tecnico','supervisor','coordinador','gerencia','administrador'].map(x=>`<option>${x}</option>`).join('')}</select></label><label>Empresa (externo)<select name="company_id"><option value="">Ninguna</option>${companies.filter(x=>x.active).map(x=>`<option value="${x.id}">${esc(x.name)}</option>`).join('')}</select></label><label>Nivel (técnico)<select name="level"><option value="">—</option><option>L1</option><option>L2</option><option>L3</option></select></label><button class="primary">Crear</button></form></div><div class="panel" style="margin-top:20px"><h2>Cuentas</h2>${table(['Usuario','Rol','Nivel','Empresa','Activo'],data.map(x=>[esc(x.username),esc(x.role),esc(x.level),esc(x.company_id),tag(x.active?'Sí':'No')+` <button data-toggle-user=\"${x.id}\" data-active=\"${x.active}\">${x.active?'Desactivar':'Activar'}</button> <button data-reset-user=\"${x.id}\">Contraseña</button>`]))}</div>`;$('user-form').onsubmit=async(e)=>{e.preventDefault();let f=Object.fromEntries(new FormData(e.target));f.company_id=f.company_id?Number(f.company_id):null;f.level=f.level||null;try{await api('/users',{method:'POST',body:JSON.stringify(f)});await goto('users');flash('Cuenta creada')}catch(e){flash(e.message,true)}}}
+async function datedShiftPanel(){
+  const available=await api('/schedule-months');
+  if(!available.months.length)return;
+  const monthNames=available.months.map(m=>{
+    const label=new Intl.DateTimeFormat('es-GT',{month:'long',year:'numeric',timeZone:'UTC'})
+       .format(new Date(m+'-01T12:00:00Z'));
+    return {month:m,label:label.charAt(0).toUpperCase()+label.slice(1)};
+  });
+  $('view').insertAdjacentHTML('beforeend',`
+    <section class="panel schedule-panel" style="margin-top:22px">
+      <div class="panel-lead"><div><h2>Jornadas por fecha</h2>
+        <p>Historial real importado por día. No se repite automáticamente en otros meses.</p>
+      </div><span class="count-pill" id="dated-count">Cargando…</span></div>
+      <div class="roster-controls">
+        <label>Mes
+          <select id="dated-month">${monthNames.map(m=>`<option value="${esc(m.month)}">${esc(m.label)}</option>`).join('')}</select>
+        </label>
+        <label>Técnico
+          <select id="dated-tech"><option value="">Todos los técnicos</option></select>
+        </label>
+        <label>Tipo
+          <select id="dated-kind"><option value="">Todos los tipos</option>
+            <option value="TURNO1">Turno diurno</option>
+            <option value="TURNO2_00-06">Turno 00–06</option>
+            <option value="TURNO2_20-24">Turno 20–24</option>
+            <option value="GUARDIA_L3">Guardia L3</option>
+          </select>
+        </label>
+        <label>Fecha
+          <input id="dated-day" type="date">
+        </label>
+      </div>
+      <div id="dated-results"></div>
+      <div class="roster-footer">
+        <span class="hint">Las guardias L3 se documentan, pero no se ofrecen como citas automáticas.</span>
+        <button id="dated-more" type="button" hidden>Mostrar más</button>
+      </div>
+    </section>`);
+  let rows=[], visible=50;
+  const days=['Domingo','Lunes','Martes','Miércoles','Jueves','Viernes','Sábado'];
+  const timeOf=n=>String(Math.floor(n/60)).padStart(2,'0')+':'+String(n%60).padStart(2,'0');
+  const render=()=>{
+    const person=$('dated-tech').value;
+    const kind=$('dated-kind').value;
+    const day=$('dated-day').value;
+    const selected=rows.filter(s=>(!person||String(s.user_id)===person)&&(!kind||s.kind===kind)&&(!day||s.date===day));
+    $('dated-count').textContent=selected.length+' jornadas';
+    $('dated-results').innerHTML=selected.length?table(
+      ['Fecha','Técnico','Nivel / tipo','Horario','Estado'],
+      selected.slice(0,visible).map(s=>{
+        const weekday=days[new Date(s.date+'T12:00:00Z').getUTCDay()];
+        const type=s.kind==='GUARDIA_L3'?'Guardia L3':s.kind==='TURNO1'?'Turno diurno':s.kind==='TURNO2_00-06'?'Turno 00–06':'Turno 20–24';
+        return [
+          `<strong>${esc(s.date)}</strong><br><span class="muted">${weekday}</span>`,
+          esc(s.username),esc(type),
+          timeOf(s.start_minute)+' – '+timeOf(s.end_minute),
+          tag(s.active?'Activo':'Inactivo')
+        ];
+      })
+    ):`<div class="empty-state"><strong>Sin jornadas para estos filtros</strong><p>Selecciona otro día o técnico, o consulta otro mes.</p></div>`;
+    $('dated-more').hidden=selected.length<=visible;
+    $('dated-more').textContent='Mostrar más ('+Math.min(50,selected.length-visible)+' de '+(selected.length-visible)+')';
+  };
+  const reload=async()=>{
+    visible=50;rows=await api('/dated-shifts?month='+encodeURIComponent($('dated-month').value));
+    const unique=[...new Map(rows.map(r=>[r.user_id,r.username])).entries()].sort((a,b)=>a[1].localeCompare(b[1],'es'));
+    $('dated-tech').innerHTML='<option value="">Todos los técnicos</option>'+unique.map(([id,name])=>`<option value="${id}">${esc(name)}</option>`).join('');
+    $('dated-day').value='';
+    $('dated-day').min=$('dated-month').value+'-01';
+    $('dated-day').max=$('dated-month').value+'-31';
+    render();
+  };
+  $('dated-month').onchange=()=>reload().catch(e=>flash(e.message,true));
+  for(const id of ['dated-tech','dated-kind','dated-day'])
+    $(id).onchange=()=>{visible=50;render();};
+  $('dated-more').onclick=()=>{visible+=50;render();};
+  await reload();
+}
+
 async function shifts(){
   const data=await api('/shifts');
   const canEdit=me.role==='supervisor';
@@ -213,6 +292,7 @@ async function shifts(){
   };
   render();
   if($('shift-filter'))$('shift-filter').onchange=e=>render(e.target.value);
+  await datedShiftPanel();
   if(!canEdit)return;
   $('shift-form').onsubmit=async e=>{
     e.preventDefault();
