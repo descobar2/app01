@@ -2,7 +2,7 @@
 
 Plataforma web para consultar y correlacionar tickets del sistema propietario, monitorear SLA, administrar empresas y perfiles, gestionar turnos y coordinar sesiones remotas.
 
-**Estado:** MVP funcional local. No reemplaza el ticket legacy. Integraciones Microsoft Graph / Teams requieren credenciales y validación de permisos. No marcar como confirmada una reunión sin respuesta de Graph o enlace válido de contingencia.
+**Estado:** MVP funcional local. No reemplaza el ticket legacy. Microsoft Graph / Teams admite autenticación con certificado; requiere configurar la identidad y el buzón organizador en el servidor. No marcar como confirmada una reunión sin respuesta de Graph o enlace válido de contingencia.
 
 ## Ejecución local
 
@@ -24,7 +24,7 @@ curl -X POST http://127.0.0.1:8000/api/bootstrap
 
 Abrir `http://127.0.0.1:8000`. La documentación de la API está en `/docs`.
 
-**Docker:** `cp .env.example .env`, definir contraseña y ejecutar `docker compose up --build -d`. La base SQLite permanece en un volumen persistente y la publicación se limita a `127.0.0.1` deliberadamente; utilice HTTPS mediante proxy inverso para acceso remoto.
+**Docker:** `cp .env.example .env`, definir contraseña y ejecutar `docker compose up --build -d`. La publicación se limita a `127.0.0.1` deliberadamente; utilice HTTPS mediante proxy inverso para acceso remoto.
 
 ## Importación de información (local, sin publicar datos)
 
@@ -55,11 +55,11 @@ Acceso mediante token opaco de sesión con caducidad máxima de **8 horas** o **
 
 Incluye ingesta idempotente CSV de 13 campos, correlación `empresa + ticket`, ordenación temporal, estados y propietario oficial, cálculo de SLA 4/24 horas con pausas, paneles por rol, consultas, exportación CSV con control de acceso, historial de escalaciones y auditoría, alta de empresas y usuarios, activación/desactivación y restablecimiento de contraseñas, turnos, ausencias, búsqueda de franjas locales, reservas sin solapamiento por bloques de 15 minutos, enlace manual autorizado y creación opcional de eventos en Graph cuando se configure.
 
-**Pendiente para producción:** reprogramación con conciliación completa, sincronización automática/reintentos de cancelación en Graph (existe conciliación manual vía API), comprobación Free/Busy corporativa y respuestas de invitación, reglas automáticas de propuesta L1→L3, mensajería Teams/WhatsApp, exportación PDF, analítica avanzada y controles de respaldo y retención de auditoría. La disponibilidad local no equivale a confirmación de Outlook.
+**Pendiente para producción:** reprogramación con conciliación completa, sincronización automática/reintentos de cancelación en Graph, comprobación Free/Busy corporativa y respuestas de invitación, reglas automáticas de propuesta L1→L3, mensajería Teams/WhatsApp, exportación CSV/PDF, detalle completo de histórico/escalaciones y controles de respaldo y retención de auditoría. La disponibilidad local no equivale a confirmación de Outlook.
 
 ## Variables opcionales para Teams
 
-`SOAST_GRAPH_TENANT_ID`, `SOAST_GRAPH_CLIENT_ID`, `SOAST_GRAPH_CLIENT_SECRET`, `SOAST_GRAPH_ORGANIZER`: identidad de una cuenta dedicada y una app Entra ID con permisos apropiados para crear eventos en `/users/{organizer}/events`. Los errores de Graph dejan la sesión `sync_pending` y no se reportan como confirmación. Se recomienda limitar el acceso de la aplicación a un buzón dedicado.
+`SOAST_GRAPH_TENANT_ID`, `SOAST_GRAPH_CLIENT_ID`, `SOAST_GRAPH_ORGANIZER`, `SOAST_GRAPH_CERT_PATH` y `SOAST_GRAPH_KEY_PATH`: identidad y rutas a archivos PEM del certificado público y la clave privada. MSAL obtiene y reutiliza tokens mediante **client credentials** sin almacenar secretos en Git. Para Docker, monte los archivos bajo `./secrets/` (excluido de Git); esta carpeta se expone como `/run/secrets/soast/` en modo solo lectura. Se mantiene compatibilidad opcional con `SOAST_GRAPH_CLIENT_SECRET` para despliegues existentes; se recomienda certificado. Se utiliza `Calendars.ReadWrite` sobre el buzón organizador; la confirmación requiere el enlace de Teams y la cancelación usa `POST /events/{id}/cancel` para notificar a asistentes. Los errores dejan `sync_pending` o `cancel_pending` y no se reportan como confirmación. Los eventos utilizan `transactionId` estable para reducir duplicados en reintentos. El reconciliador opcional (`docker compose --profile graph up -d` o `python -m app.graph_worker`) reintenta cada 5 minutos hasta 3 veces después del intento inicial; registra en auditoría las incidencias agotadas. No sustituye la revisión humana de discrepancias sin identificador externo. Se recomienda limitar el acceso de la aplicación a un buzón dedicado.
 
 ## Pruebas
 

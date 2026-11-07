@@ -16,7 +16,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-import httpx
+from .graph import GraphError, graph_configured, graph_request, events_path
 from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -299,7 +299,7 @@ def home():
 
 @app.get("/api/health")
 def health(db: Session = Depends(db)):
-    return {"service":"ok", "database":"ok", "graph_configured":bool(os.getenv("SOAST_GRAPH_CLIENT_ID") and os.getenv("SOAST_GRAPH_ORGANIZER")),
+    return {"service":"ok", "database":"ok", "graph_configured":graph_configured(),
             "events":db.scalar(select(func.count()).select_from(TicketEvent))}
 
 @app.post("/api/bootstrap")
@@ -588,47 +588,44 @@ def availability(ticket_id:int,day:str,duration:int,user:User=Depends(require_us
     return {"starts_at":result,"calendar_status":"local_only", "notice":"Disponibilidad corporativa no verificada en Microsoft Graph"}
 
 async def sync_graph(db:Session,s:SupportSession):
-    """Reconcile Teams event; errors retain a pending state."""
-    tenant=os.getenv("SOAST_GRAPH_TENANT_ID")
-    client=os.getenv("SOAST_GRAPH_CLIENT_ID")
-    secret=os.getenv("SOAST_GRAPH_CLIENT_SECRET")
-    organizer=os.getenv("SOAST_GRAPH_ORGANIZER")
-    if not all([tenant,client,secret,organizer]):
+    """Synchronize an Outlook event without claiming success until Teams URL exists."""
+    if not graph_configured():
         s.graph_error="Microsoft Graph no configurado";db.commit();return
+    s.graph_attempts += 1
+    s.graph_last_attempt=now()
+    db.commit()  # Persist attempts before outbound calls, including network timeouts.
     try:
-        s.graph_attempts += 1
-        s.graph_last_attempt=now()
-        async with httpx.AsyncClient(timeout=12.0) as http:
-            auth=await http.post(f"https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token",
-                data={"client_id":client,"client_secret":secret,"scope":"https://graph.microsoft.com/.default","grant_type":"client_credentials"})
-            auth.raise_for_status()
-            token=auth.json()["access_token"]
-            headers={"Authorization":f"Bearer {token}"}
-            if s.state=="cancel_pending" and s.graph_event_id:
-                r=await http.delete(f"https://graph.microsoft.com/v1.0/users/{organizer}/events/{s.graph_event_id}",headers=headers)
-                r.raise_for_status()
-                s.state="cancelled";s.graph_error=None
-                db.query(SessionSlot).filter(SessionSlot.session_id==s.id).delete()
-                db.commit();return
+        base=events_path()
+        if s.state=="cancel_pending":
             if not s.graph_event_id:
-                body={"subject":f"SOAST - Ticket {db.get(Ticket,s.ticket_id).legacy_id}",
-                      "start":{"dateTime":utc(s.starts_at).replace(tzinfo=None).isoformat(),"timeZone":"UTC"},
-                      "end":{"dateTime":utc(s.ends_at).replace(tzinfo=None).isoformat(),"timeZone":"UTC"},
-                      "isOnlineMeeting":True,"onlineMeetingProvider":"teamsForBusiness",
-                      "attendees":[{"emailAddress":{"address":s.invitee_email},"type":"required"}],
-                      "transactionId":f"soast-session-{s.id}"}
-                r=await http.post(f"https://graph.microsoft.com/v1.0/users/{organizer}/events",json=body,
-                                  headers=headers)
-                r.raise_for_status();data=r.json();s.graph_event_id=data["id"]
-                s.teams_url=(data.get("onlineMeeting") or {}).get("joinUrl")
-            else:
-                r=await http.get(f"https://graph.microsoft.com/v1.0/users/{organizer}/events/{s.graph_event_id}",headers=headers)
-                r.raise_for_status()
-                s.teams_url=(r.json().get("onlineMeeting") or {}).get("joinUrl")
-            if s.teams_url:s.state="confirmed";s.graph_error=None
-            else:s.graph_error="Evento creado; enlace Teams todavía no disponible"
-    except (httpx.HTTPError,KeyError,ValueError) as exc:
-        s.graph_error=f"Sincronización pendiente: {type(exc).__name__}"
+                raise GraphError("Cancelación requiere conciliación manual: evento sin ID confirmado")
+            try:
+                await graph_request("POST",f"{base}/{s.graph_event_id}/cancel",json={"comment":"Cancelada por SOAST"})
+            except GraphError as exc:
+                # An event that no longer exists has no active invitation to cancel.
+                if "HTTP 404" not in str(exc):raise
+            s.state="cancelled";s.graph_error=None
+            db.query(SessionSlot).filter(SessionSlot.session_id==s.id).delete()
+            db.commit();return
+        if s.state!="sync_pending":return
+        if not s.graph_event_id:
+            payload={"subject":f"SOAST - Ticket {db.get(Ticket,s.ticket_id).legacy_id}",
+                "start":{"dateTime":utc(s.starts_at).replace(tzinfo=None).isoformat(),"timeZone":"UTC"},
+                "end":{"dateTime":utc(s.ends_at).replace(tzinfo=None).isoformat(),"timeZone":"UTC"},
+                "isOnlineMeeting":True,"onlineMeetingProvider":"teamsForBusiness",
+                "attendees":[{"emailAddress":{"address":s.invitee_email},"type":"required"}],
+                "transactionId":f"soast-session-{s.id}"}
+            result=(await graph_request("POST",base,json=payload)).json()
+            s.graph_event_id=result["id"]
+        else:
+            result=(await graph_request("GET",f"{base}/{s.graph_event_id}")).json()
+        s.teams_url=(result.get("onlineMeeting") or {}).get("joinUrl") or s.teams_url
+        if s.teams_url:
+            s.state="confirmed";s.graph_error=None
+        else:
+            s.graph_error="Evento registrado; enlace Teams pendiente de publicación"
+    except (GraphError,KeyError,ValueError,TypeError) as exc:
+        s.graph_error=f"Sincronización pendiente: {str(exc) if isinstance(exc,GraphError) else type(exc).__name__}"
     db.commit()
 
 @app.post("/api/sessions")
@@ -669,7 +666,7 @@ async def cancel(session_id:int,user:User=Depends(require_user),db:Session=Depen
     s=scoped_session(db,user,session_id,True)
     if s.state=="cancelled":return session_dict(db,s)
     if utc(s.starts_at)<=now()+timedelta(minutes=15):raise HTTPException(409,"Cancelación fuera del límite")
-    s.state="cancel_pending" if s.graph_event_id else "cancelled"
+    s.state="cancel_pending" if s.graph_event_id or (graph_configured() and s.graph_attempts>0) else "cancelled"
     if s.state=="cancelled":db.query(SessionSlot).filter(SessionSlot.session_id==s.id).delete()
     audit(db,user,"cancel","session",str(s.id));db.commit()
     # Cancellation pending retains occupied slots until Graph confirms deletion.

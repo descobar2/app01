@@ -112,3 +112,68 @@ def test_export_and_account_reset():
     assert client.get('/api/me',headers=external).status_code==401
     assert client.post('/api/login',json={'username':'externo1','password':'password-long-123'}).status_code==401
     assert token('externo1','another-safe-password')
+
+
+def test_graph_certificate_auth_and_safe_retries(monkeypatch, tmp_path):
+    import asyncio
+    import sys
+    from types import SimpleNamespace
+    import httpx
+    from app import graph
+    from app.main import SupportSession, sync_graph
+
+    cert=tmp_path/'graph.crt';key=tmp_path/'graph.key'
+    cert.write_text('TEST-CERT');key.write_text('TEST-KEY')
+    monkeypatch.setenv('SOAST_GRAPH_TENANT_ID','test-tenant')
+    monkeypatch.setenv('SOAST_GRAPH_CLIENT_ID','test-client')
+    monkeypatch.setenv('SOAST_GRAPH_ORGANIZER','organizer@example.org')
+    monkeypatch.setenv('SOAST_GRAPH_CERT_PATH',str(cert))
+    monkeypatch.setenv('SOAST_GRAPH_KEY_PATH',str(key))
+    monkeypatch.delenv('SOAST_GRAPH_CLIENT_SECRET',raising=False)
+
+    observed={}
+    class App:
+        def __init__(self,**kwargs):observed.update(kwargs)
+        def acquire_token_for_client(self,**kwargs):return {'access_token':'TEST-TOKEN'}
+    monkeypatch.setitem(sys.modules,'msal',SimpleNamespace(ConfidentialClientApplication=App))
+    graph._msal_app.cache_clear()
+    assert graph.graph_configured()
+    assert graph._get_token()=='TEST-TOKEN'
+    assert observed['client_credential']['private_key']=='TEST-KEY'
+    assert observed['client_credential']['public_certificate']=='TEST-CERT'
+
+    with DbSession() as db:
+        ticket=db.query(Ticket).filter_by(legacy_id='500').one()
+        tech=db.query(User).filter_by(username='technician1').one()
+        supervisor=db.query(User).filter_by(username='supervisor1').one()
+        date=datetime.now(timezone.utc)+timedelta(days=8)
+        session=SupportSession(ticket_id=ticket.id,technician_id=tech.id,created_by=supervisor.id,
+                               starts_at=date,ends_at=date+timedelta(minutes=30),
+                               invitee_email='client@example.org',state='sync_pending')
+        db.add(session);db.commit()
+        sid=session.id
+
+    calls=[]
+    async def fake(method,path,**kwargs):
+        calls.append((method,path,kwargs))
+        if method=='POST' and path.endswith('/cancel'):
+            return httpx.Response(202)
+        if method=='POST':
+            if len([c for c in calls if c[0]=='POST' and not c[1].endswith('/cancel')])==1:
+                raise graph.GraphError('Microsoft Graph HTTP 503')
+            return httpx.Response(201,json={'id':'event-123',
+                'onlineMeeting':{'joinUrl':'https://teams.microsoft.com/l/meetup-join/example'}})
+        raise AssertionError((method,path))
+    monkeypatch.setattr('app.main.graph_request',fake)
+    with DbSession() as db:
+        session=db.get(SupportSession,sid)
+        asyncio.run(sync_graph(db,session))
+        assert session.state=='sync_pending' and session.graph_attempts==1
+        asyncio.run(sync_graph(db,session))
+        assert session.state=='confirmed' and session.graph_event_id=='event-123'
+        assert session.teams_url.startswith('https://teams.microsoft.com/')
+        session.state='cancel_pending';db.commit()
+        asyncio.run(sync_graph(db,session))
+        assert session.state=='cancelled' and session.graph_error is None
+    assert '/cancel' in calls[-1][1]
+    assert calls[1][2]['json']['transactionId']==f'soast-session-{sid}'
