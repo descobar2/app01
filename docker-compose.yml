@@ -1,0 +1,25 @@
+services:
+  soast:
+    build: .
+    env_file: .env
+    environment:
+      SOAST_DATABASE_URL: sqlite:////data/soast.db
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - soast-data:/data
+      - ./secrets:/run/secrets/soast:ro
+    restart: unless-stopped
+  graph-worker:
+    profiles: ["graph"]
+    build: .
+    env_file: .env
+    environment:
+      SOAST_DATABASE_URL: sqlite:////data/soast.db
+    command: ["python", "-m", "app.graph_worker"]
+    volumes:
+      - soast-data:/data
+      - ./secrets:/run/secrets/soast:ro
+    restart: unless-stopped
+volumes:
+  soast-data:
