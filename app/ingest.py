@@ -3,6 +3,7 @@
 Usage: python -m app.ingest companies DatosTeecmo.xlsx
        python -m app.ingest technicians DatosTeecmo.xlsx
        python -m app.ingest logs 0901261.txt
+       python -m app.ingest shifts turnos_agentes_2026-10.csv [--dry-run] [--alias ORIGEN=USUARIO]
 Never commit source customer files or this import's local database.
 """
 from __future__ import annotations
@@ -11,14 +12,14 @@ import argparse
 import csv
 import hashlib
 import secrets
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
-from .main import Company, DbSession, ImportIssue, Ticket, TicketEvent, User, hash_password
+from .main import Company, DatedShift, DbSession, ImportIssue, ScheduleImportCoverage, Ticket, TicketEvent, User, hash_password
 
 NORMAL_STATUS = {"DIAGNOSTICO":"DIAGNOSTICO", "DIAGNÓSTICO":"DIAGNOSTICO","COLA":"COLA", "PROGRESO":"PROGRESO", "ESPERA":"ESPERA", "RESUELTO":"RESUELTO", "CERRADO":"CERRADO"}
 LEVELS = {"L1","L2","L3","FABRICA"}
@@ -125,12 +126,136 @@ def import_logs(path:Path):
     return metrics
 
 
+
+SHIFT_KINDS = {"TURNO1", "TURNO2_00-06", "TURNO2_20-24", "GUARDIA_L3"}
+SHIFT_COLUMNS = ["usuario", "nivel", "tipo", "fecha", "hora_inicio", "hora_fin"]
+
+
+def _minute(value: str) -> int:
+    try:
+        hour, minute = value.split(":")
+        if len(hour) != 2 or len(minute) != 2 or not hour.isdecimal() or not minute.isdecimal():
+            raise ValueError
+        number = int(hour) * 60 + int(minute)
+        if int(hour) > 23 or int(minute) > 59:
+            raise ValueError
+        return number
+    except (ValueError, AttributeError) as exc:
+        raise ValueError("hora inválida (se requiere HH:MM)") from exc
+
+
+def import_dated_shifts(path: Path, aliases: dict[str, str] | None = None, dry_run: bool = False):
+    """Atomic import of actual dated schedules; invalid users do not become new accounts.
+
+    A source spelling difference must be resolved explicitly with --alias, not guessed.
+    Schedule coverage is committed only with valid rows, so days off remain unbookable.
+    """
+    aliases = {key.strip().lower(): value.strip().lower() for key, value in (aliases or {}).items()}
+    parsed = []
+    with path.open("r", encoding="utf-8-sig", newline="") as handle:
+        reader = csv.DictReader(handle)
+        if reader.fieldnames != SHIFT_COLUMNS:
+            raise ValueError("Encabezados inválidos: se requieren " + ",".join(SHIFT_COLUMNS))
+        for line, row in enumerate(reader, 2):
+            try:
+                if None in row or any(row.get(field) is None for field in SHIFT_COLUMNS):
+                    raise ValueError("número de columnas inválido")
+                source_user = row["usuario"].strip().lower()
+                username = aliases.get(source_user, source_user)
+                level = row["nivel"].strip().upper()
+                kind = row["tipo"].strip().upper()
+                day = date.fromisoformat(row["fecha"].strip())
+                start = _minute(row["hora_inicio"].strip())
+                end = _minute(row["hora_fin"].strip())
+                if not username or level not in {"L1", "L2", "L3"} or kind not in SHIFT_KINDS:
+                    raise ValueError("usuario, nivel o tipo desconocido")
+                if kind == "GUARDIA_L3" and level != "L3":
+                    raise ValueError("guardia requiere nivel L3")
+                if not 0 <= start < end <= 1439:
+                    raise ValueError("rango horario inválido")
+                parsed.append((line, source_user, username, level, kind, day, start, end))
+            except (ValueError, TypeError, AttributeError) as exc:
+                raise ValueError(f"Línea {line}: {exc}") from exc
+    if not parsed:
+        raise ValueError("El CSV no contiene jornadas para importar")
+    start_day = min(item[5] for item in parsed)
+    end_day = max(item[5] for item in parsed)
+    source = path.name
+    with DbSession() as db:
+        users = {u.username.lower(): u for u in db.scalars(select(User).where(User.role == "tecnico")).all()}
+        missing = {}
+        mismatched = {}
+        for _, source_user, username, level, _, _, _, _ in parsed:
+            user = users.get(username)
+            if user is None:
+                missing[source_user] = missing.get(source_user, 0) + 1
+            elif user.level != level:
+                mismatched[source_user] = f"{user.level} != {level}"
+        if missing or mismatched:
+            problems = []
+            if missing:
+                problems.append("Usuarios sin correspondencia: " + ", ".join(
+                    f"{key} ({count} jornadas)" for key, count in sorted(missing.items())))
+            if mismatched:
+                problems.append("Niveles diferentes: " + ", ".join(
+                    f"{key} ({value})" for key, value in sorted(mismatched.items())))
+            raise ValueError("; ".join(problems) + ". No se importó ningún turno. Revise el origen o use --alias origen=usuario_confirmado.")
+        existing = {
+            (s.user_id, s.work_date, s.start_minute, s.end_minute, s.kind)
+            for s in db.scalars(select(DatedShift).where(
+                DatedShift.work_date >= start_day, DatedShift.work_date <= end_day)).all()
+        }
+        unique = set()
+        additions = []
+        duplicates = 0
+        for line, _, username, _, kind, day, start, end in parsed:
+            key = (users[username].id, day, start, end, kind)
+            if key in existing or key in unique:
+                duplicates += 1
+            else:
+                unique.add(key)
+                additions.append((line, key))
+        result = {
+            "total": len(parsed), "created" if not dry_run else "would_create": len(additions),
+            "duplicate": duplicates, "from": start_day.isoformat(), "to": end_day.isoformat(),
+            "dry_run": dry_run
+        }
+        if dry_run:
+            return result
+        for line, (user_id, day, start, end, kind) in additions:
+            db.add(DatedShift(user_id=user_id, work_date=day, start_minute=start,
+                              end_minute=end, kind=kind, source=source, source_line=line))
+        if not db.scalar(select(ScheduleImportCoverage.id).where(
+                ScheduleImportCoverage.source == source,
+                ScheduleImportCoverage.start_day == start_day,
+                ScheduleImportCoverage.end_day == end_day).limit(1)):
+            db.add(ScheduleImportCoverage(source=source, start_day=start_day, end_day=end_day))
+        db.commit()
+        return result
+
 def main():
     parser=argparse.ArgumentParser(description="Importación local segura de fuentes TEECMO")
-    parser.add_argument("mode",choices=["companies","technicians","logs"])
+    parser.add_argument("mode",choices=["companies","technicians","logs","shifts"])
     parser.add_argument("path",type=Path)
+    parser.add_argument("--alias", action="append", default=[], metavar="ORIGEN=USUARIO",
+                        help="Asociación explícita para nombres diferentes; no modifica cuentas")
+    parser.add_argument("--dry-run", action="store_true", help="Validar sin escribir en la BD")
     args=parser.parse_args()
     if not args.path.is_file():parser.error("Archivo no encontrado")
+    if args.mode != "shifts" and (args.alias or args.dry_run):
+        parser.error("--alias y --dry-run solo se admiten para shifts")
+    if args.mode == "shifts":
+        aliases = {}
+        for mapping in args.alias:
+            if mapping.count("=") != 1 or not all(mapping.split("=")):
+                parser.error("--alias requiere ORIGEN=USUARIO")
+            source_name, target_name = mapping.split("=", 1)
+            aliases[source_name] = target_name
+        try:
+            print(import_dated_shifts(args.path, aliases=aliases, dry_run=args.dry_run))
+        except ValueError as exc:
+            parser.error(str(exc))
+        return
     operation={"companies":import_companies,"technicians":import_technicians,"logs":import_logs}[args.mode]
     print(operation(args.path))
 
