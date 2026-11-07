@@ -66,18 +66,169 @@ async function detail(id){
 }
 async function escalations(){const d=await api('/escalations');$('view').innerHTML=`<div class="panel"><h2>Cambios de nivel observados en el sistema propietario</h2>${table(['Ticket','Empresa','Nivel origen','Destino','Fecha','Ruta'],d.map(x=>[esc(x.ticket),esc(x.company_id),esc(x.from_level),esc(x.to_level),pretty(x.at),tag(x.valid_route?'Ruta válida':'Revisar ruta')]))}</div>`}
 async function sessions(){
- const list=await api('/sessions');
- const canBook=['externo','supervisor','coordinador'].includes(me.role);
- $('view').innerHTML=`${canBook?`<div class="panel"><h2>Programar sesión</h2><form id="book-form" class="box-form"><label>ID de ticket en SOAST<input name="ticket_id" type="number" min="1" required></label><label>Fecha<input name="day" type="date" required></label><label>Duración<select name="duration"><option>30</option><option>60</option><option>90</option><option>120</option></select></label><button type="button" id="find-slots">Consultar horarios</button><label>Horarios disponibles<select name="starts_at" id="slots" required><option value="">Consulta primero</option></select></label><label>Correo del invitado<input name="invitee_email" type="email" required></label><button class="primary">Reservar</button></form><p class="hint">Las franjas corresponden a turnos internos; disponibilidad de Microsoft 365 pendiente de validación.</p></div>`:''}<div class="panel" style="margin-top:20px"><h2>Sesiones</h2>${table(['Ticket','Técnico','Inicio','Estado','Reunión','Acción'],list.map(s=>[esc(s.ticket),esc(s.technician),pretty(s.starts_at),tag(s.state),s.teams_url?`<a href="${esc(s.teams_url)}" target="_blank" rel="noopener noreferrer">Abrir Teams</a>`:'Pendiente',canBook&&s.state!=='cancelled'?`<button data-cancel="${s.id}">Cancelar</button>`:'—']))}</div>`;
- if(canBook){
-   $('find-slots').onclick=async()=>{let f=new FormData($('book-form'));try{let d=await api('/availability?ticket_id='+encodeURIComponent(f.get('ticket_id'))+'&day='+encodeURIComponent(f.get('day'))+'&duration='+encodeURIComponent(f.get('duration')));$('slots').innerHTML=d.starts_at.length?d.starts_at.map(s=>`<option value="${esc(s)}">${pretty(s)}</option>`).join(''):'<option value="">Sin horarios disponibles</option>';if(d.calendar_status==='local_only')flash(d.notice);}catch(e){flash(e.message,true)}};
-   $('book-form').onsubmit=async(e)=>{e.preventDefault();let f=new FormData(e.target);try{let s=await api('/sessions',{method:'POST',body:JSON.stringify({ticket_id:Number(f.get('ticket_id')),starts_at:f.get('starts_at'),duration:Number(f.get('duration')),invitee_email:f.get('invitee_email')})});await goto('sessions');flash('Sesión registrada: '+s.state);}catch(e){flash(e.message,true)}};
- }
+  const canBook=['externo','supervisor','coordinador'].includes(me.role);
+  const [list,ticketsList]=await Promise.all([
+    api('/sessions'),
+    canBook?api('/tickets?limit=100'):Promise.resolve([])
+  ]);
+  const ticketOptions=ticketsList.filter(t=>!['CERRADO','RESUELTO'].includes(t.status));
+  const booking=canBook?`
+    <section class="panel schedule-panel">
+      <div class="panel-lead">
+        <div><h2>Programar una sesión</h2><p>Selecciona el caso, consulta los horarios y envía la invitación de Microsoft Teams.</p></div>
+      </div>
+      <form id="book-form" class="organized-form booking-form">
+        <div class="form-step"><span class="step-number">1</span><strong>Datos de la solicitud</strong></div>
+        <label class="field-ticket">Ticket de soporte
+          <select name="ticket_id" required ${ticketOptions.length?'':'disabled'}>
+            <option value="">Selecciona un ticket</option>
+            ${ticketOptions.map(t=>`<option value="${t.id}">#${esc(t.legacy_id)} · ${esc(t.product)} · ${esc(t.level)}</option>`).join('')}
+          </select>
+        </label>
+        <label class="field-day">Fecha
+          <input name="day" type="date" required>
+        </label>
+        <label class="field-duration">Duración
+          <select name="duration">
+            <option value="30">30 minutos</option><option value="60">60 minutos</option>
+            <option value="90">90 minutos</option><option value="120">120 minutos</option>
+          </select>
+        </label>
+        <div class="form-step"><span class="step-number">2</span><strong>Disponibilidad</strong></div>
+        <label class="field-slots">Horarios disponibles
+          <select name="starts_at" id="slots" required disabled><option value="">Primero consulta la disponibilidad</option></select>
+        </label>
+        <button type="button" id="find-slots" class="secondary-action" ${ticketOptions.length?'':'disabled'}>Consultar horarios</button>
+        <div class="form-step"><span class="step-number">3</span><strong>Invitación y confirmación</strong></div>
+        <label class="field-email">Correo del invitado
+          <input name="invitee_email" type="email" placeholder="usuario@empresa.com" autocomplete="email" required>
+        </label>
+        <button class="primary action-book" ${ticketOptions.length?'':'disabled'}>Reservar sesión</button>
+      </form>
+      ${ticketOptions.length?'':`<div class="notice-inline">No hay tickets abiertos elegibles para programar sesiones.</div>`}
+      <div class="notice-inline">Los horarios se calculan con turnos y reservas internas. La disponibilidad del calendario de Microsoft 365 aún no se comprueba automáticamente.</div>
+    </section>`:'';
+  const sessionRows=list.map(s=>[
+    `<strong>#${esc(s.ticket)}</strong>`,
+    esc(s.technician),pretty(s.starts_at),tag(s.state),
+    s.teams_url?`<a href="${esc(s.teams_url)}" target="_blank" rel="noopener noreferrer">Unirse por Teams</a>`:'Pendiente de enlace',
+    canBook&&!['cancelled','cancel_pending'].includes(s.state)?`<button data-cancel="${s.id}" class="small-action">Cancelar</button>`:'—'
+  ]);
+  $('view').innerHTML=`<div class="schedule-page">
+    ${booking}
+    <section class="panel schedule-panel">
+      <div class="panel-lead"><div><h2>Sesiones programadas</h2><p>Consulta el técnico asignado, el estado y el acceso a la reunión.</p></div><span class="count-pill">${list.length} sesiones</span></div>
+      ${list.length?table(['Ticket','Técnico','Inicio','Estado','Reunión','Acción'],sessionRows):
+      `<div class="empty-state"><strong>Aún no hay sesiones programadas</strong><p>Cuando se registre una reserva, aparecerá aquí junto con su enlace de Teams y su estado.</p></div>`}
+    </section>
+  </div>`;
+  if(!canBook)return;
+  const form=$('book-form');
+  const selector=$('slots');
+  const resetSlots=()=>{selector.disabled=true;selector.innerHTML='<option value="">Consulta primero la disponibilidad</option>';};
+  for(const name of ['ticket_id','day','duration'])form.elements[name].addEventListener('change',resetSlots);
+  $('find-slots').onclick=async()=>{
+    const f=new FormData(form);
+    if(!f.get('ticket_id')||!f.get('day')){flash('Selecciona un ticket y una fecha para consultar horarios.',true);return;}
+    resetSlots();
+    try{
+      const url='/availability?ticket_id='+encodeURIComponent(f.get('ticket_id'))+'&day='+encodeURIComponent(f.get('day'))+'&duration='+encodeURIComponent(f.get('duration'));
+      const d=await api(url);
+      selector.innerHTML=d.starts_at.length?d.starts_at.map(s=>`<option value="${esc(s)}">${pretty(s)}</option>`).join(''):'<option value="">Sin horarios disponibles para esta fecha</option>';
+      selector.disabled=!d.starts_at.length;
+      if(d.starts_at.length)flash(d.starts_at.length+' horarios disponibles. Selecciona uno para reservar.');
+      else flash('No hay horarios disponibles. Comprueba los turnos y que existan técnicos activos.',true);
+    }catch(e){flash(e.message,true);}
+  };
+  form.onsubmit=async e=>{
+    e.preventDefault();
+    const f=new FormData(form);
+    if(!f.get('starts_at')){flash('Primero consulta y selecciona un horario disponible.',true);return;}
+    try{
+      const s=await api('/sessions',{method:'POST',body:JSON.stringify({
+        ticket_id:Number(f.get('ticket_id')),starts_at:f.get('starts_at'),
+        duration:Number(f.get('duration')),invitee_email:f.get('invitee_email')
+      })});
+      await goto('sessions');
+      flash('Sesión registrada. Estado: '+s.state);
+    }catch(error){flash(error.message,true);}
+  };
 }
 async function health(){const d=await api('/health');$('view').innerHTML=`<div class="grid"><article class="metric"><span>API</span><strong>${esc(d.service)}</strong></article><article class="metric"><span>Base de datos</span><strong>${esc(d.database)}</strong></article><article class="metric"><span>Eventos importados</span><strong>${esc(d.events)}</strong></article><article class="metric"><span>Microsoft Graph</span><strong style="font-size:17px">${d.graph_configured?'Configurado':'Pendiente'}</strong></article></div><div class="panel" style="margin-top:20px"><h2>Importación local</h2><p>Ejecutar en el servidor los comandos documentados de importación. No adjuntar datos reales al repositorio público.</p></div>`}
 async function companies(){let data=await api('/companies');$('view').innerHTML=`<div class="panel"><h2>Agregar empresa</h2><form id="company-form" class="box-form"><label>Código<input name="code" required></label><label>Nombre<input name="name" required></label><button class="primary">Guardar</button></form></div><div class="panel" style="margin-top:20px"><h2>Empresas registradas (${data.length})</h2>${table(['Código','Empresa','Estado'],data.map(c=>[esc(c.code),esc(c.name),tag(c.active?'Activa':'Inactiva')+` <button data-toggle-company=\"${c.id}\" data-active=\"${c.active}\">${c.active?'Desactivar':'Activar'}</button>`]))}</div>`;$('company-form').onsubmit=async(e)=>{e.preventDefault();try{await api('/companies',{method:'POST',body:JSON.stringify(Object.fromEntries(new FormData(e.target)))});await goto('companies');flash('Empresa registrada')}catch(e){flash(e.message,true)}}}
 async function users(){const data=await api('/users');const companies=await api('/companies');$('view').innerHTML=`<div class="panel"><h2>Crear cuenta</h2><form id="user-form" class="box-form"><label>Usuario<input name="username" required></label><label>Contraseña inicial<input name="password" type="password" minlength="12" required></label><label>Rol<select name="role">${['externo','tecnico','supervisor','coordinador','gerencia','administrador'].map(x=>`<option>${x}</option>`).join('')}</select></label><label>Empresa (externo)<select name="company_id"><option value="">Ninguna</option>${companies.filter(x=>x.active).map(x=>`<option value="${x.id}">${esc(x.name)}</option>`).join('')}</select></label><label>Nivel (técnico)<select name="level"><option value="">—</option><option>L1</option><option>L2</option><option>L3</option></select></label><button class="primary">Crear</button></form></div><div class="panel" style="margin-top:20px"><h2>Cuentas</h2>${table(['Usuario','Rol','Nivel','Empresa','Activo'],data.map(x=>[esc(x.username),esc(x.role),esc(x.level),esc(x.company_id),tag(x.active?'Sí':'No')+` <button data-toggle-user=\"${x.id}\" data-active=\"${x.active}\">${x.active?'Desactivar':'Activar'}</button> <button data-reset-user=\"${x.id}\">Contraseña</button>`]))}</div>`;$('user-form').onsubmit=async(e)=>{e.preventDefault();let f=Object.fromEntries(new FormData(e.target));f.company_id=f.company_id?Number(f.company_id):null;f.level=f.level||null;try{await api('/users',{method:'POST',body:JSON.stringify(f)});await goto('users');flash('Cuenta creada')}catch(e){flash(e.message,true)}}}
-async function shifts(){const data=await api('/shifts');let admin=['supervisor'].includes(me.role);let techs=admin?(await api('/users')).filter(u=>u.role==='tecnico'):[];$('view').innerHTML=`${admin?`<div class="panel"><h2>Configurar turno recurrente</h2><form id="shift-form" class="box-form"><label>Técnico<select name="user_id">${techs.map(t=>`<option value="${t.id}">${esc(t.username)} (${esc(t.level)})</option>`).join('')}</select></label><label>Día<select name="weekday">${['Lunes','Martes','Miércoles','Jueves','Viernes','Sábado','Domingo'].map((d,i)=>`<option value="${i}">${d}</option>`).join('')}</select></label><label>Hora inicio<input type="time" name="start" value="08:00" required></label><label>Hora fin<input type="time" name="end" value="17:00" required></label><button class="primary">Guardar turno</button></form></div>`:''}<div class="panel" style="margin-top:20px"><h2>Turnos registrados</h2>${table(['Técnico ID','Día','Inicio','Fin'],data.map(s=>[esc(s.user_id),['Lun','Mar','Mié','Jue','Vie','Sáb','Dom'][s.weekday],String(Math.floor(s.start_minute/60)).padStart(2,'0')+':'+String(s.start_minute%60).padStart(2,'0'),String(Math.floor(s.end_minute/60)).padStart(2,'0')+':'+String(s.end_minute%60).padStart(2,'0')]))}</div>`;if(admin)$('shift-form').onsubmit=async e=>{e.preventDefault();let f=new FormData(e.target);let min=t=>Number(t.split(':')[0])*60+Number(t.split(':')[1]);try{await api('/shifts',{method:'POST',body:JSON.stringify({user_id:Number(f.get('user_id')),weekday:Number(f.get('weekday')),start_minute:min(f.get('start')),end_minute:min(f.get('end'))})});await goto('shifts');flash('Turno creado')}catch(e){flash(e.message,true)}}}
+async function shifts(){
+  const data=await api('/shifts');
+  const canEdit=me.role==='supervisor';
+  const techs=['supervisor','coordinador'].includes(me.role)?(await api('/users')).filter(u=>u.role==='tecnico'):[];
+  const byId=new Map(techs.map(t=>[t.id,t]));
+  const nameOf=id=>byId.get(id)?.username||(me.role==='tecnico'?'Mi turno':'Técnico #'+id);
+  const days=['Lunes','Martes','Miércoles','Jueves','Viernes','Sábado','Domingo'];
+  const timeOf=n=>String(Math.floor(n/60)).padStart(2,'0')+':'+String(n%60).padStart(2,'0');
+  const ordered=[...data].sort((a,b)=>nameOf(a.user_id).localeCompare(nameOf(b.user_id),'es')||a.weekday-b.weekday||a.start_minute-b.start_minute);
+  const form=canEdit?`
+    <section class="panel schedule-panel">
+      <div class="panel-lead"><div><h2>Configurar turno recurrente</h2><p>Define la jornada semanal del técnico. Los turnos se utilizan al consultar la disponibilidad de sesiones.</p></div></div>
+      <form id="shift-form" class="organized-form shift-form">
+        <label class="field-technician">Técnico
+          <select name="user_id" required ${techs.length?'':'disabled'}>
+            <option value="">Selecciona un técnico</option>
+            ${techs.map(t=>`<option value="${t.id}">${esc(t.username)} · ${esc(t.level)}${t.active?'':' (inactivo)'}</option>`).join('')}
+          </select>
+        </label>
+        <label class="field-weekday">Día de la semana
+          <select name="weekday">${days.map((d,i)=>`<option value="${i}">${d}</option>`).join('')}</select>
+        </label>
+        <label class="field-start">Hora de inicio
+          <input type="time" name="start" value="08:00" required>
+        </label>
+        <label class="field-end">Hora de finalización
+          <input type="time" name="end" value="17:00" required>
+        </label>
+        <div class="form-actions"><button class="primary" ${techs.length?'':'disabled'}>Guardar turno</button></div>
+      </form>
+      <div class="notice-inline">Los técnicos importados inicialmente están inactivos. Para asignarles sesiones deben estar activos y tener un turno registrado.</div>
+    </section>`:'';
+  $('view').innerHTML=`<div class="schedule-page">
+    ${form}
+    <section class="panel schedule-panel">
+      <div class="panel-lead"><div><h2>Turnos registrados</h2><p>Jornadas semanales por técnico, expresadas en horario de Guatemala.</p></div><span class="count-pill">${data.length} turnos</span></div>
+      ${techs.length&&data.length?`<div class="shift-toolbar"><label for="shift-filter">Filtrar por técnico</label><select id="shift-filter"><option value="">Todos los técnicos</option>${techs.filter(t=>data.some(s=>s.user_id===t.id)).map(t=>`<option value="${t.id}">${esc(t.username)}</option>`).join('')}</select></div>`:''}
+      <div id="shift-results"></div>
+    </section>
+  </div>`;
+  const render=(filter='')=>{
+    const shown=ordered.filter(s=>!filter||String(s.user_id)===filter);
+    $('shift-results').innerHTML=shown.length?table(['Técnico','Día','Horario','Duración','Cuenta'],shown.map(s=>{
+      const tech=byId.get(s.user_id);
+      const duration=(s.end_minute-s.start_minute)/60;
+      return [
+        `<strong>${esc(nameOf(s.user_id))}</strong>`,
+        esc(days[s.weekday]||'—'),
+        `${timeOf(s.start_minute)} – ${timeOf(s.end_minute)}`,
+        `${Number.isInteger(duration)?duration:duration.toFixed(2)} h`,
+        tech?tag(tech.active?'Activo':'Inactivo'):'—'
+      ];
+    })):`<div class="empty-state"><strong>${filter?'Este técnico no tiene turnos':'Aún no hay turnos registrados'}</strong><p>${canEdit?'Utiliza el formulario superior para registrar la primera jornada.':'El supervisor debe configurar las jornadas de los técnicos.'}</p></div>`;
+  };
+  render();
+  if($('shift-filter'))$('shift-filter').onchange=e=>render(e.target.value);
+  if(!canEdit)return;
+  $('shift-form').onsubmit=async e=>{
+    e.preventDefault();
+    const f=new FormData(e.target);
+    const min=t=>Number(t.split(':')[0])*60+Number(t.split(':')[1]);
+    const start=min(f.get('start')),end=min(f.get('end'));
+    if(end<=start){flash('La hora de finalización debe ser posterior a la hora de inicio.',true);return;}
+    try{
+      await api('/shifts',{method:'POST',body:JSON.stringify({
+        user_id:Number(f.get('user_id')),weekday:Number(f.get('weekday')),
+        start_minute:start,end_minute:end
+      })});
+      await goto('shifts');flash('Turno semanal registrado correctamente.');
+    }catch(error){flash(error.message,true);}
+  };
+}
 async function audit(){const data=await api('/audit');$('view').innerHTML=`<div class="panel"><h2>Últimas operaciones</h2>${table(['Fecha','Actor','Acción','Entidad','ID','Detalle'],data.map(x=>[pretty(x.date),esc(x.actor_id),esc(x.action),esc(x.entity),esc(x.entity_id),esc(x.detail)]))}</div>`}
 async function issues(){const data=await api('/import-issues');$('view').innerHTML=`<div class="panel"><h2>Registros no procesados</h2>${table(['Archivo','Secuencia','Motivo'],data.map(x=>[esc(x.source),esc(x.seq),esc(x.reason)]))}</div>`}
 $('login-form').onsubmit=async e=>{e.preventDefault();const f=new FormData(e.target);try{const result=await api('/login',{method:'POST',body:JSON.stringify(Object.fromEntries(f))});token=result.token;sessionStorage.setItem('soast_token',token);me=await api('/me');showApp()}catch(err){flash(err.message,true)}};
