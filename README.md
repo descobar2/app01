@@ -36,6 +36,35 @@ python -m app.ingest technicians /ruta/privada/DatosTeecmo.xlsx
 python -m app.ingest logs /ruta/privada/0901261.txt
 ```
 
+### Jornadas por fecha (CSV mensual)
+
+El archivo `turnos_agentes_2026-10.csv` debe permanecer **local**. Contiene
+`usuario,nivel,tipo,fecha,hora_inicio,hora_fin` y permite registrar
+`TURNO1`, `TURNO2_00-06`, `TURNO2_20-24` y `GUARDIA_L3`.
+
+Primero validar sin escribir en la base de datos:
+
+```bash
+python -m app.ingest shifts /ruta/privada/turnos_agentes_2026-10.csv --dry-run
+```
+
+El importador exige que cada usuario del CSV exista como técnico y tenga el mismo
+nivel. Ante una diferencia de escritura, **no modifica la base de datos** y muestra
+cuántas jornadas requieren correspondencia. Tras confirmar la identidad, puede
+indicarse un alias explícito, sin renombrar la cuenta existente:
+
+```bash
+python -m app.ingest shifts /ruta/privada/turnos_agentes_2026-10.csv --dry-run --alias NOMBRE_CSV=NOMBRE_REGISTRADO
+python -m app.ingest shifts /ruta/privada/turnos_agentes_2026-10.csv --alias NOMBRE_CSV=NOMBRE_REGISTRADO
+```
+
+La importación es atómica e idempotente, conserva la fecha y el tipo de jornada.
+Para fechas cubiertas por el archivo, los turnos fechados prevalecen sobre los
+semanales; los días sin turno permanecen no disponibles. `GUARDIA_L3` se
+visualiza pero **no** habilita automáticamente reservas. En la interfaz **Turnos**
+pueden consultarse meses, técnicos y tipos; no se atribuyen turnos de octubre a
+noviembre ni se crean reuniones retroactivas.
+
 Las cuentas técnicas importadas están **desactivadas** y sin contraseña conocida: el administrador debe provisionarles credenciales antes de habilitarlas. Los eventos se identifican por nombre de archivo y secuencia, evitando duplicados de relectura. Registros inválidos o empresas no reconocidas quedan separados como incidencias. Para otros orígenes se necesita una regla de mapeo previamente validada.
 
 **IMPORTANTE:** `DatosTeecmo.xlsx` y `0901261.txt` contienen información de clientes y personal. El repositorio es público. No agregarlos al control de versiones, ni tampoco `.env`, bases de datos o logs.
