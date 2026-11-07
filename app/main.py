@@ -5,7 +5,9 @@ legacy ownership or status. All timestamps stored in UTC.
 """
 from __future__ import annotations
 
+import csv
 import hashlib
+import io
 import hmac
 import os
 import secrets
@@ -16,7 +18,7 @@ from zoneinfo import ZoneInfo
 
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request, status
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, UniqueConstraint, create_engine, func, select
@@ -89,6 +91,16 @@ class TicketEvent(Base):
     actor: Mapped[str | None] = mapped_column(String(80), nullable=True)
     activity: Mapped[str | None] = mapped_column(String(12), nullable=True)
 
+class AssignmentProposal(Base):
+    __tablename__ = "assignment_proposals"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    ticket_id: Mapped[int] = mapped_column(ForeignKey("tickets.id"),index=True)
+    technician_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True),default=lambda:datetime.now(UTC))
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    state: Mapped[str] = mapped_column(String(20),default="proposed")
+    rule: Mapped[str] = mapped_column(String(160))
+
 class ImportIssue(Base):
     __tablename__ = "import_issues"
     __table_args__ = (UniqueConstraint("source", "source_seq"),)
@@ -128,6 +140,7 @@ class SupportSession(Base):
     graph_error: Mapped[str | None] = mapped_column(String(500), nullable=True)
     invitee_email: Mapped[str] = mapped_column(String(250))
     graph_attempts: Mapped[int] = mapped_column(Integer,default=0)
+    graph_last_attempt: Mapped[datetime | None] = mapped_column(DateTime(timezone=True),nullable=True)
 
 class SessionSlot(Base):
     __tablename__ = "session_slots"
@@ -444,6 +457,43 @@ def dashboard(user:User=Depends(require_user),db:Session=Depends(db)):
     denominator=counts["cumplidos"]+counts["incumplidos"]
     return {"total":len(all_t),"counts":counts,"compliance_pct":round(counts["cumplidos"]*100/denominator,2) if denominator else None}
 
+def csv_cell(value):
+    text = str(value if value is not None else "")
+    return "'" + text if text and text[0] in "=+-@\t\r" else text
+
+@app.get("/api/reports/tickets.csv")
+def export_tickets(user:User=Depends(require_user),db:Session=Depends(db)):
+    permit(user,"externo","tecnico","supervisor","coordinador","gerencia")
+    stmt=select(Ticket)
+    if user.role=="externo":stmt=stmt.where(Ticket.company_id==user.company_id)
+    if user.role=="tecnico":stmt=stmt.where(Ticket.owner==user.username)
+    buffer=io.StringIO();writer=csv.writer(buffer)
+    writer.writerow(["empresa","ticket","tipo","producto","prioridad","estado","nivel","owner","sla_estado","sla_horas"])
+    for t in db.scalars(stmt.order_by(Ticket.id)):
+        metric=sla(db,t)
+        writer.writerow([csv_cell(x) for x in [t.company_id,t.legacy_id,t.type,t.product,t.priority,t.status,t.level,t.owner,metric["state"],metric["hours"]]])
+    audit(db,user,"export_csv","tickets","all","Ámbito por rol aplicado");db.commit()
+    buffer.seek(0)
+    return StreamingResponse(iter([buffer.getvalue()]),media_type="text/csv; charset=utf-8",
+                headers={"Content-Disposition":"attachment; filename=soast-tickets.csv"})
+
+@app.get("/api/escalations")
+def escalations(user:User=Depends(require_user),db:Session=Depends(db)):
+    permit(user,"externo","tecnico","supervisor","coordinador")
+    stmt=select(Ticket)
+    if user.role=="externo":stmt=stmt.where(Ticket.company_id==user.company_id)
+    routes={("L1","L2"),("L2","L3"),("L2","FABRICA"),("L3","FABRICA")}
+    result=[]
+    for ticket in db.scalars(stmt):
+        events=db.scalars(select(TicketEvent).where(TicketEvent.ticket_id==ticket.id).order_by(TicketEvent.occurred_at,TicketEvent.id)).all()
+        for previous,current in zip(events,events[1:]):
+            if current.level!=previous.level:
+                result.append({"ticket_id":ticket.id,"ticket":ticket.legacy_id,"company_id":ticket.company_id,
+                               "from_level":previous.level,"to_level":current.level,
+                               "valid_route":(previous.level,current.level) in routes,
+                               "at":utc(current.occurred_at).isoformat()})
+    return result[-200:]
+
 @app.get("/api/shifts")
 def shifts(user:User=Depends(require_user),db:Session=Depends(db)):
     permit(user,"supervisor","coordinador","tecnico")
@@ -547,6 +597,7 @@ async def sync_graph(db:Session,s:SupportSession):
         s.graph_error="Microsoft Graph no configurado";db.commit();return
     try:
         s.graph_attempts += 1
+        s.graph_last_attempt=now()
         async with httpx.AsyncClient(timeout=12.0) as http:
             auth=await http.post(f"https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token",
                 data={"client_id":client,"client_secret":secret,"scope":"https://graph.microsoft.com/.default","grant_type":"client_credentials"})

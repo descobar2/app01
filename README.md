@@ -24,7 +24,7 @@ curl -X POST http://127.0.0.1:8000/api/bootstrap
 
 Abrir `http://127.0.0.1:8000`. La documentación de la API está en `/docs`.
 
-**Docker:** `cp .env.example .env`, definir contraseña y ejecutar `docker compose up --build -d`. La publicación se limita a `127.0.0.1` deliberadamente; utilice HTTPS mediante proxy inverso para acceso remoto.
+**Docker:** `cp .env.example .env`, definir contraseña y ejecutar `docker compose up --build -d`. La base SQLite permanece en un volumen persistente y la publicación se limita a `127.0.0.1` deliberadamente; utilice HTTPS mediante proxy inverso para acceso remoto.
 
 ## Importación de información (local, sin publicar datos)
 
@@ -53,9 +53,9 @@ Acceso mediante token opaco de sesión con caducidad máxima de **8 horas** o **
 
 ## Alcance de esta entrega
 
-Incluye ingesta idempotente CSV de 13 campos, correlación `empresa + ticket`, ordenación temporal, estados y propietario oficial, cálculo de SLA 4/24 horas con pausas, paneles por rol, consultas y auditoría, alta de empresas y usuarios, turnos, ausencias, búsqueda de franjas locales, reservas sin solapamiento por bloques de 15 minutos, enlace manual autorizado y creación opcional de eventos en Graph cuando se configure.
+Incluye ingesta idempotente CSV de 13 campos, correlación `empresa + ticket`, ordenación temporal, estados y propietario oficial, cálculo de SLA 4/24 horas con pausas, paneles por rol, consultas, exportación CSV con control de acceso, historial de escalaciones y auditoría, alta de empresas y usuarios, activación/desactivación y restablecimiento de contraseñas, turnos, ausencias, búsqueda de franjas locales, reservas sin solapamiento por bloques de 15 minutos, enlace manual autorizado y creación opcional de eventos en Graph cuando se configure.
 
-**Pendiente para producción:** reprogramación con conciliación completa, sincronización automática/reintentos de cancelación en Graph, comprobación Free/Busy corporativa y respuestas de invitación, reglas automáticas de propuesta L1→L3, mensajería Teams/WhatsApp, exportación CSV/PDF, detalle completo de histórico/escalaciones y controles de respaldo y retención de auditoría. La disponibilidad local no equivale a confirmación de Outlook.
+**Pendiente para producción:** reprogramación con conciliación completa, sincronización automática/reintentos de cancelación en Graph (existe conciliación manual vía API), comprobación Free/Busy corporativa y respuestas de invitación, reglas automáticas de propuesta L1→L3, mensajería Teams/WhatsApp, exportación PDF, analítica avanzada y controles de respaldo y retención de auditoría. La disponibilidad local no equivale a confirmación de Outlook.
 
 ## Variables opcionales para Teams
 

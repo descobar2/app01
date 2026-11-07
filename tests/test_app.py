@@ -93,3 +93,22 @@ def test_session_permission_and_collision():
         clash=c.post('/api/sessions',headers=external,json=p)
     assert clash.status_code==409
     assert client.get('/api/sessions',headers=token('technician1','password-long-123')).status_code==200
+
+
+def test_export_and_account_reset():
+    admin=token('soast_admin','testing-password-456')
+    external=token('externo1','password-long-123')
+    result=client.get('/api/reports/tickets.csv',headers=external)
+    assert result.status_code==200
+    assert 'soast-tickets.csv' in result.headers['content-disposition']
+    assert b'2,777' not in result.content  # No cross-company CSV data.
+    assert b'1,777' in result.content
+    assert client.get('/api/escalations',headers=external).status_code==200
+    assert client.get('/api/reports/tickets.csv',headers=admin).status_code==403
+    with DbSession() as db:
+        target=db.query(User).filter_by(username='externo1').one()
+    r=client.post(f'/api/users/{target.id}/password',headers=admin,json={'password':'another-safe-password'})
+    assert r.status_code==200
+    assert client.get('/api/me',headers=external).status_code==401
+    assert client.post('/api/login',json={'username':'externo1','password':'password-long-123'}).status_code==401
+    assert token('externo1','another-safe-password')

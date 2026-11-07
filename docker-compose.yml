@@ -2,6 +2,8 @@ services:
   soast:
     build: .
     env_file: .env
+    environment:
+      SOAST_DATABASE_URL: sqlite:////data/soast.db
     ports:
       - "127.0.0.1:8000:8000"
     volumes:
