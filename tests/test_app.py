@@ -177,3 +177,74 @@ def test_graph_certificate_auth_and_safe_retries(monkeypatch, tmp_path):
         assert session.state=='cancelled' and session.graph_error is None
     assert '/cancel' in calls[-1][1]
     assert calls[1][2]['json']['transactionId']==f'soast-session-{sid}'
+
+def test_dated_shift_import_is_atomic_dated_and_idempotent(tmp_path):
+    from zoneinfo import ZoneInfo
+    import pytest
+    from sqlalchemy import select, func
+    from app.ingest import import_dated_shifts
+    from app.main import DatedShift, ScheduleImportCoverage, candidates
+
+    path = tmp_path / "sample_roster.csv"
+    path.write_text(
+        "usuario,nivel,tipo,fecha,hora_inicio,hora_fin\\n"
+        "technician1,L1,TURNO1,2026-10-01,08:00,10:00\\n"
+        "typo_tech,L1,TURNO2_20-24,2026-10-02,20:00,23:59\\n",
+        encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="Usuarios sin correspondencia"):
+        import_dated_shifts(path, dry_run=True)
+    with DbSession() as db:
+        assert db.scalar(select(func.count()).select_from(DatedShift)) == 0
+        assert db.scalar(select(func.count()).select_from(ScheduleImportCoverage)) == 0
+    mapping = {"typo_tech": "technician1"}
+    dry = import_dated_shifts(path, aliases=mapping, dry_run=True)
+    assert dry["would_create"] == 2 and dry["dry_run"]
+    with DbSession() as db:
+        assert db.scalar(select(func.count()).select_from(DatedShift)) == 0
+    imported = import_dated_shifts(path, aliases=mapping)
+    assert imported["created"] == 2 and imported["duplicate"] == 0
+    rerun = import_dated_shifts(path, aliases=mapping)
+    assert rerun["created"] == 0 and rerun["duplicate"] == 2
+    supervisor = token("supervisor1", "password-long-123")
+    external = token("externo1", "another-safe-password")
+    tech = token("technician1", "password-long-123")
+    months = client.get("/api/schedule-months", headers=supervisor).json()["months"]
+    assert "2026-10" in months
+    rows = client.get("/api/dated-shifts?month=2026-10", headers=supervisor).json()
+    assert len(rows) == 2
+    assert {row["kind"] for row in rows} == {"TURNO1", "TURNO2_20-24"}
+    assert client.get("/api/dated-shifts?month=2026-10", headers=tech).status_code == 200
+    assert client.get("/api/dated-shifts?month=2026-10", headers=external).status_code == 403
+    assert client.get("/api/dated-shifts?month=2026-99", headers=supervisor).status_code == 422
+    with DbSession() as db:
+        ticket = db.query(Ticket).filter_by(legacy_id="500").one()
+        at = datetime(2026, 10, 1, 9, 0, tzinfo=ZoneInfo("America/Guatemala"))
+        assert candidates(db, ticket, at, at+timedelta(minutes=30))
+        outside = datetime(2026, 10, 1, 12, 0, tzinfo=ZoneInfo("America/Guatemala"))
+        assert candidates(db, ticket, outside, outside+timedelta(minutes=30)) == []
+
+
+def test_guard_roster_is_not_bookable(tmp_path):
+    from zoneinfo import ZoneInfo
+    from app.ingest import import_dated_shifts
+    from app.main import candidates
+    admin = token("soast_admin", "testing-password-456")
+    r = client.post("/api/users", headers=admin, json={
+        "username": "technician_guard", "password": "password-long-123",
+        "role": "tecnico", "level": "L3"
+    })
+    assert r.status_code == 200, r.text
+    path = tmp_path/"guard.csv"
+    path.write_text(
+        "usuario,nivel,tipo,fecha,hora_inicio,hora_fin\\n"
+        "technician_guard,L3,GUARDIA_L3,2026-10-03,00:00,23:59\\n",
+        encoding="utf-8"
+    )
+    assert import_dated_shifts(path)["created"] == 1
+    with DbSession() as db:
+        ticket=db.query(Ticket).filter_by(legacy_id="500").one()
+        ticket.level = "L3"
+        db.commit()
+        at=datetime(2026,10,3,12,0,tzinfo=ZoneInfo("America/Guatemala"))
+        assert candidates(db,ticket,at,at+timedelta(minutes=30)) == []
