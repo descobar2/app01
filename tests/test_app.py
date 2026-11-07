@@ -187,9 +187,9 @@ def test_dated_shift_import_is_atomic_dated_and_idempotent(tmp_path):
 
     path = tmp_path / "sample_roster.csv"
     path.write_text(
-        "usuario,nivel,tipo,fecha,hora_inicio,hora_fin\\n"
-        "technician1,L1,TURNO1,2026-10-01,08:00,10:00\\n"
-        "typo_tech,L1,TURNO2_20-24,2026-10-02,20:00,23:59\\n",
+        "usuario,nivel,tipo,fecha,hora_inicio,hora_fin\n"
+        "technician1,L1,TURNO1,2026-10-01,08:00,10:00\n"
+        "typo_tech,L1,TURNO2_20-24,2026-10-02,20:00,23:59\n",
         encoding="utf-8"
     )
     with pytest.raises(ValueError, match="Usuarios sin correspondencia"):
@@ -237,8 +237,8 @@ def test_guard_roster_is_not_bookable(tmp_path):
     assert r.status_code == 200, r.text
     path = tmp_path/"guard.csv"
     path.write_text(
-        "usuario,nivel,tipo,fecha,hora_inicio,hora_fin\\n"
-        "technician_guard,L3,GUARDIA_L3,2026-10-03,00:00,23:59\\n",
+        "usuario,nivel,tipo,fecha,hora_inicio,hora_fin\n"
+        "technician_guard,L3,GUARDIA_L3,2026-10-03,00:00,23:59\n",
         encoding="utf-8"
     )
     assert import_dated_shifts(path)["created"] == 1
