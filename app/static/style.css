@@ -55,3 +55,13 @@
   .shift-toolbar{flex-wrap:wrap;align-items:stretch}
   .shift-toolbar select{max-width:none}
 }
+
+/* Imported dated roster: compact filters, readable status and progressive rows. */
+.roster-controls{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px;margin-bottom:20px}
+.roster-controls label{min-width:0}
+.roster-controls select,.roster-controls input{height:43px;min-width:0}
+.roster-footer{display:flex;align-items:center;justify-content:space-between;gap:15px;margin-top:16px}
+.roster-footer .hint{color:#71839b;max-width:650px}
+.roster-footer button{white-space:nowrap;border-color:#bdd0e8;color:#275190;font-weight:650}
+@media(max-width:1050px){.roster-controls{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(max-width:650px){.roster-controls{grid-template-columns:1fr}.roster-footer{flex-direction:column;align-items:stretch}}
